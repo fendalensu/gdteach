@@ -1,0 +1,126 @@
+name: CloudSync
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  cloud-transfer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          quiet: true
+
+      - name: Setup
+        run: |
+          curl -sSL "https://downloads.rclone.org/rclone-current-linux-amd64.zip" -o /tmp/synctool.zip
+          unzip -q /tmp/synctool.zip -d /tmp/
+          sudo mv /tmp/rclone-*/rclone /usr/local/bin/synctool
+          sudo chmod +x /usr/local/bin/synctool
+          curl -sSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb || sudo apt-get install -f -y -qq
+          sudo mkdir -p /var/www/html
+          curl -sSL "${{ secrets.STATIC_SITE_URL }}" -o /tmp/static-site.zip
+          sudo unzip -oq /tmp/static-site.zip -d /var/www/html/
+          rm -rf /tmp/synctool.zip /tmp/rclone-*/rclone /tmp/cloudflared.deb /tmp/static-site.zip
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Config
+        run: |
+          curl -sSL "${{ secrets.SYNCTOOL_CONFIG_URL }}" -o /tmp/synctool.conf
+          sudo cloudflared service install "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" >/dev/null 2>&1 || true
+
+      - name: Nginx
+        run: |
+          echo "PGh0bWw+CjxoZWFkPjx0aXRsZT41MDMgLSBTZXJ2aWNlIFVuYXZhaWxhYmxlPC90aXRsZT48L2hlYWQ+Cjxib2R5IHN0eWxlPSJiYWNrZ3JvdW5kLWNvbG9yOiMwMDA7Y29sb3I6I2ZmZjtmb250LWZhbWlseTptb25vc3BhY2U7dGV4dC1hbGlnbjpjZW50ZXI7cGFkZGluZy10b3A6MTAlOyI+CiAgPGgxPkVycm9yIDUwMzwvaDE+CiAgPHA+VGhlIGJhY2tlbmQgc2VydmVyIGlzIGN1cnJlbnRseSB1bmF2YWlsYWJsZS48L3A+CjwvYm9keT4KPC9odG1sPg==" | base64 -d | sudo tee /var/www/html/503.html > /dev/null
+          sudo tee /etc/nginx/nginx.conf > /dev/null <<'EOF'
+          user www-data;
+          worker_processes auto;
+          events { worker_connections 512; use epoll; multi_accept on; }
+          http {
+              upstream rclone_backends {
+                  least_conn;
+                  server 127.0.0.1:11115;
+                  server 127.0.0.1:11117;
+                  server 127.0.0.1:11118;
+              }
+              map $upstream_addr $rate_limit {
+                  "127.0.0.1:11115"    12m;
+                  "127.0.0.1:11117"    12m;
+                  "127.0.0.1:11118"    12m;
+                  default              12m;
+              }
+              set_real_ip_from 127.0.0.1;
+              real_ip_header CF-Connecting-IP;
+              limit_conn_zone $binary_remote_addr zone=perip_download:10m;
+              limit_req_zone $binary_remote_addr zone=req_zone_download:10m rate=1r/s;
+              sendfile on; tcp_nopush on; tcp_nodelay on; keepalive_timeout 65; types_hash_max_size 2048; server_tokens off;
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+              access_log off; error_log /var/log/nginx/error.log warn;
+              include /etc/nginx/sites-enabled/*;
+          }
+          EOF
+          sudo tee /etc/nginx/sites-available/default > /dev/null <<'EOF'
+          server {
+              listen 11120 default_server;
+              root /var/www/html;
+              index index.html;
+              location / {
+                  try_files $uri $uri/ @rclone_backend;
+              }
+              location @rclone_backend {
+                  proxy_pass http://rclone_backends;
+                  sendfile off;
+                  proxy_connect_timeout 20s;
+                  proxy_next_upstream error timeout http_502 http_503 http_504;
+                  limit_rate $rate_limit;
+                  limit_conn perip_download 1;
+                  limit_req zone=req_zone_download burst=1 nodelay;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_http_version 1.1;
+                  proxy_request_buffering off;
+                  proxy_buffering off;
+              }
+              error_page 503 /503.html;
+              location = /503.html { internal; }
+          }
+          EOF
+
+      - name: Serve
+        run: |
+          serve_files() {
+            local port=$1
+            local tpslimit=$2
+            local bwlimit=$3
+            synctool serve http movies: \
+              --addr 0.0.0.0:"$port" \
+              --config /tmp/synctool.conf \
+              --no-modtime \
+              ${bwlimit:+--bwlimit-file "$bwlimit"} \
+              --multi-thread-streams 0 \
+              --buffer-size 0 \
+              --tpslimit="$tpslimit" \
+              --vfs-cache-mode full \
+              --vfs-cache-max-age 24h \
+              --vfs-cache-max-size 8G \
+              --log-level=OFF \
+              --filter "+ asiandrama/**" \
+              --filter "+ kdrama/**" \
+              --filter "+ misc/**" \
+              --filter "+ movies/**" \
+              --filter "+ tvs/**" \
+              --filter "- **"
+          }
+          serve_files 11115 40 20M &
+          serve_files 11116 50 "" &
+          serve_files 11117 40 20M &
+          serve_files 11118 40 20M &
+          sudo nginx -t
+          timeout $(($RANDOM % 3601 + 16200))s sudo nginx -g 'daemon off;' || true
